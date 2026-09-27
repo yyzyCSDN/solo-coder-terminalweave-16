@@ -10,6 +10,11 @@ from terminalweave.gate.appointments import GateSlotPolicy, GateBook
 from terminalweave.customs.holds import CustomsLedger, HoldRecord
 from terminalweave.reefer.monitoring import ReeferPolicy, ReeferMonitor, ReeferReading, AlarmState
 from terminalweave.hazmat.compatibility import CompatibilityMatrix, SegregationChecker, HazmatUnit
+from terminalweave.hazmat.emergency import EmergencyGuide, EmergencyGuidebook
+from terminalweave.hazmat.isolation import (IsolationController, IncidentLevel, ActionState,
+    AdjacentContainer, ResponseResource)
+from terminalweave.hazmat.placards import DeclaredHazmat, PlacardObservation
+from terminalweave.core.errors import StateTransitionError, ValidationError
 from terminalweave.equipment.maintenance import EquipmentMeter, MaintenancePlan, MaintenanceManager
 from terminalweave.rail.blocks import Wagon, RailContainer, RailBlockPlanner
 from terminalweave.billing.demurrage import BusinessCalendar, TariffBand, DemurrageTariff, DemurrageCalculator
@@ -69,6 +74,80 @@ def test_hazmat_matrix_checks_declared_pair():
     checker=SegregationChecker(matrix)
     a=HazmatUnit("A","3","Z",0,0);b=HazmatUnit("B","8","Z",11,0)
     assert checker.check_pair(a,b)[0]
+
+def _isolation_controller():
+    guides=EmergencyGuidebook([
+        EmergencyGuide("3",50,100,False,"foam"),
+        EmergencyGuide("4.3",150,300,True,"dry_powder"),
+    ])
+    matrix=CompatibilityMatrix();matrix.set_compatible("3","8",25)
+    return IsolationController(guides,matrix)
+
+def _declared(cid="C1",classes=("3",)):
+    return DeclaredHazmat(cid,frozenset(classes),frozenset({"UN1993"}))
+
+def test_isolation_uses_worst_case_when_evidence_conflicts():
+    c=_isolation_controller()
+    observed=PlacardObservation("C1",frozenset({"4.3"}),frozenset({"UN1993"}))
+    inc=c.open_incident("I1","C1",_declared(),observed,[],[],D,"ops")
+    plan=inc.plan
+    assert plan.conflicting_evidence
+    assert plan.hazard_classes==frozenset({"3","4.3"})
+    assert plan.isolation_m==150 and plan.evacuation_m==300 and plan.avoid_water
+
+def test_isolation_filters_resources_and_orders_moves():
+    c=_isolation_controller()
+    resources=[ResponseResource("E-WATER","water"),ResponseResource("E-FOAM","foam"),
+               ResponseResource("E-DOWN","foam",available=False)]
+    inc=c.open_incident("I1","C1",_declared(classes=("4.3",)),None,[],resources,D,"ops")
+    plan=inc.plan
+    assert plan.usable_resources==("E-FOAM",)
+
+def test_isolation_move_order_prioritises_under_separated_cargo():
+    c=_isolation_controller()
+    adjacent=[AdjacentContainer("GEN",10),AdjacentContainer("FAR",80),
+              AdjacentContainer("ACID",20,frozenset({"8"})),
+              AdjacentContainer("UNK",15,frozenset({"2.1"}))]
+    inc=c.open_incident("I1","C1",_declared(),None,adjacent,[],D,"ops")
+    order=inc.plan.move_order
+    assert [a.container_id for a in order]==["UNK","ACID","GEN"]
+    assert order[0].reason=="incompatible or under-separated cargo"
+    assert order[-1].reason=="within isolation radius"
+
+def test_isolation_replan_keeps_committed_actions():
+    c=_isolation_controller()
+    adjacent=[AdjacentContainer("A",10),AdjacentContainer("B",20)]
+    inc=c.open_incident("I1","C1",_declared(),None,adjacent,[],D,"ops")
+    c.commit_action("I1","B",D+timedelta(minutes=5),"ops")
+    inc=c.replan("I1",_declared(),None,[AdjacentContainer("D",5)],[],D+timedelta(minutes=6),"ops")
+    order=inc.plan.move_order
+    assert order[0].container_id=="B" and order[0].state==ActionState.COMMITTED and order[0].sequence==2
+    assert [a.container_id for a in order if a.state==ActionState.PLANNED]==["D"]
+    with pytest.raises(StateTransitionError):
+        c.commit_action("I1","B",D+timedelta(minutes=7),"ops")
+
+def test_isolation_escalation_and_stand_down_are_audited():
+    c=_isolation_controller()
+    inc=c.open_incident("I1","C1",_declared(),None,[AdjacentContainer("A",10)],[],D,"ops")
+    c.commit_action("I1","A",D+timedelta(minutes=1),"ops")
+    with pytest.raises(StateTransitionError):
+        c.stand_down("I1",D+timedelta(minutes=2),"ops","all clear")
+    c.complete_action("I1","A",D+timedelta(minutes=3),"ops")
+    c.escalate("I1",D+timedelta(minutes=4),"chief","fire spreading")
+    assert inc.level==IncidentLevel.ESCALATED
+    c.stand_down("I1",D+timedelta(minutes=5),"chief","area safe")
+    assert inc.level==IncidentLevel.STOOD_DOWN
+    trail=c.audit_trail("I1")
+    assert [e.event for e in trail]==["opened","action_committed","action_completed","escalated","stood_down"]
+    assert trail[-2].actor=="chief" and "fire spreading" in trail[-2].detail
+    assert [e.revision for e in trail]==[1,2,3,4,5]
+    with pytest.raises(StateTransitionError):
+        c.replan("I1",_declared(),None,[],[],D+timedelta(minutes=6),"ops")
+
+def test_isolation_fails_closed_without_guide():
+    c=_isolation_controller()
+    with pytest.raises(ValidationError):
+        c.open_incident("I1","C1",_declared(classes=("6.1",)),None,[],[],D,"ops")
 
 def test_maintenance_creates_due_order():
     mgr=MaintenanceManager();mgr.register_plan(MaintenancePlan("P",100));mgr.register_meter(EquipmentMeter("E",105,D))
