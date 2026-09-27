@@ -9,10 +9,13 @@ class EmergencyGuide:
     evacuation_m: float
     water_reactive: bool
     firefighting_medium: str
+    min_ppe_level: int = 1
 
     def __post_init__(self):
         if min(self.isolation_m, self.evacuation_m) < 0 or self.evacuation_m < self.isolation_m:
             raise ValidationError('invalid emergency distances')
+        if self.min_ppe_level not in (1, 2, 3):
+            raise ValidationError('invalid ppe level')
 
 class EmergencyGuidebook:
 
